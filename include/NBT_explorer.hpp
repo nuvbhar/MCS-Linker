@@ -1,24 +1,29 @@
 #pragma once
+
+#include <functional>
 #include <iostream>
+#include <optional>
+#include <ranges>
 #include <string>
 #include <unordered_map>
 
 // Force the master switch ON for the library
-#define NBT_USE_ZLIB 
+#define NBT_USE_ZLIB
 #include <nbt_cpp/NBT_All.hpp>
+
+using CompoundMap = std::unordered_map<NBT_Type::String, NBT_Node>;
+using OptionalCompound = std::optional<std::reference_wrapper<const CompoundMap>>;
 
 class NBTExplorer {
 private:
     NBT_Type::Compound rootTag;
 
-    // Helper: Convert standard string to C++20 u8string
-    std::u8string ToU8(const std::string& str) {
-        return std::u8string(str.begin(), str.end());
+    static std::u8string ToU8(const std::string& str) {
+        return std::u8string{str.begin(), str.end()};
     }
 
-    // Helper: Convert C++20 u8string back to standard string for terminal printing
-    std::string FromU8(const std::u8string_view& u8str) {
-        return std::string(u8str.begin(), u8str.end());
+    static std::string FromU8(const std::u8string_view& u8str) {
+        return std::string{u8str.begin(), u8str.end()};
     }
 
 public:
@@ -28,65 +33,117 @@ public:
     }
 
     // 2. Bypass the dummy wrapper and grab the master "Data" folder (Now CONST)
-    const std::unordered_map<NBT_Type::String, NBT_Node>* GetMasterDataMap() {
+    OptionalCompound GetMasterDataMap() const {
         auto& rawRoot = rootTag.GetData();
-        if (rawRoot.empty()) return nullptr;
+        if (rawRoot.empty()) return std::nullopt;
 
-        auto it = rawRoot.begin();
-        auto& innerMap = it->second.GetCompound().GetData();
-        
-        NBT_Type::String dataKey(ToU8("Data"));
-        if (innerMap.count(dataKey)) {
-            return &innerMap.at(dataKey).GetCompound().GetData();
+        const auto& wrapperNode = rawRoot.begin()->second;
+        auto& innerMap = wrapperNode.GetCompound().GetData();
+
+        if (const NBT_Type::String dataKey(ToU8("Data")); innerMap.contains(dataKey)) {
+            return std::cref(innerMap.at(dataKey).GetCompound().GetData());
         }
-        return nullptr;
+        return std::nullopt;
     }
 
     // 3. Print everything inside a specific folder (Now accepts CONST)
-    void PrintFolderContents(const std::unordered_map<NBT_Type::String, NBT_Node>* currentMap) {
+    static void PrintFolderContents(const OptionalCompound& currentMap) {
         if (!currentMap) return;
-        
-        std::cout << "\n--- Folder Contents (" << currentMap->size() << " items) ---\n";
-        for (auto& pair : *currentMap) {
-            std::cout << "- " << reinterpret_cast<const char*>(pair.first.c_str()) << "\n";
+
+        const auto& map = currentMap->get();
+        std::cout << "\n--- Folder Contents (" << map.size() << " items) ---\n";
+        for (const auto& key : map | std::views::keys) {
+            std::cout << "- " << key.c_str() << "\n";
         }
         std::cout << "----------------------------------\n";
     }
 
     // 4. Jump into a specific sub-folder safely (Now returns and accepts CONST)
-    const std::unordered_map<NBT_Type::String, NBT_Node>* EnterSubFolder(const std::unordered_map<NBT_Type::String, NBT_Node>* currentMap, const std::string& folderName) {
-        NBT_Type::String searchKey(ToU8(folderName));
-        
-        if (currentMap->count(searchKey)) {
-            try {
-                // Try to crack it open as a compound (folder)
-                return &currentMap->at(searchKey).GetCompound().GetData();
-            } catch (...) {
-                std::cout << "[!] Error: '" << folderName << "' is a raw value, not a folder!\n";
-                return nullptr;
-            }
+    static OptionalCompound EnterSubFolder(const OptionalCompound& currentMap, const std::string& folderName) {
+        if (!currentMap) return std::nullopt;
+
+        const auto& map = currentMap->get();
+        const NBT_Type::String searchKey(ToU8(folderName));
+        const auto it = map.find(searchKey);
+
+        if (it == map.end()) {
+            std::cout << "[!] Error: Folder '" << folderName << "' does not exist here.\n";
+            return std::nullopt;
         }
-        std::cout << "[!] Error: Folder '" << folderName << "' does not exist here.\n";
-        return nullptr;
+        try {
+            return std::cref(it->second.GetCompound().GetData());
+        } catch (...) {
+            std::cout << "[!] Error: '" << folderName << "' is a raw value, not a folder!\n";
+            return std::nullopt;
+        }
     }
+
     // 5. Read a raw value (Numbers, Text, etc.)
-    void ReadRawValue(const std::unordered_map<NBT_Type::String, NBT_Node>* currentMap, const std::string& valueName) {
-        NBT_Type::String searchKey(ToU8(valueName));
-        
-        if (currentMap->count(searchKey)) {
-            auto& node = currentMap->at(searchKey);
-            std::cout << ">> " << valueName << " = ";
-            
-            // The Try-Catch Ladder: Test every common data type until one succeeds!
-            try { std::cout << node.GetLong() << " (Long)\n"; return; } catch (...) {}
-            try { std::cout << node.GetInt() << " (Integer)\n"; return; } catch (...) {}
-            try { std::cout << node.GetFloat() << " (Float)\n"; return; } catch (...) {}
-            try { std::cout << node.GetDouble() << " (Double)\n"; return; } catch (...) {}
-            try { std::cout << (int)node.GetByte() << " (Byte/Bool)\n"; return; } catch (...) {}
-            
-            std::cout << "[Unable to print: Might be text or an array]\n";
-        } else {
+    static std::string ReadRawValue(const OptionalCompound& currentMap, const std::string& valueName) {
+        if (!currentMap) return "{error}";
+
+        const auto& map = currentMap->get();
+        const NBT_Type::String searchKey(ToU8(valueName));
+        const auto it = map.find(searchKey);
+
+        if (it == map.end()) {
             std::cout << "[!] Error: Value '" << valueName << "' does not exist here.\n";
+            return "{error}";
+        }
+
+        auto& node = it->second;
+
+        switch (node.GetTag()) {
+        case NBT_TAG::Byte:
+            return std::to_string(static_cast<int>(node.GetByte()));
+        case NBT_TAG::Short:
+            return std::to_string(node.GetShort());
+        case NBT_TAG::Int:
+            return std::to_string(node.GetInt());
+        case NBT_TAG::Long:
+            return std::to_string(node.GetLong());
+        case NBT_TAG::Float:
+            return std::to_string(node.GetFloat());
+        case NBT_TAG::Double:
+            return std::to_string(node.GetDouble());
+        case NBT_TAG::String:
+            return node.GetString().ToCharTypeUTF8();
+        default:
+            return "[Unable to print: compound or array type]";
+        }
+    }
+
+    static std::string GetValueType(const OptionalCompound& currentMap, const std::string& valueName) {
+        if (!currentMap) return "{error}";
+
+        const auto& map = currentMap->get();
+        const NBT_Type::String searchKey(ToU8(valueName));
+        const auto it = map.find(searchKey);
+
+        if (it == map.end()) {
+            std::cout << "[!] Error: Value '" << valueName << "' does not exist here.\n";
+            return "{error}";
+        }
+
+        auto& node = it->second;
+
+        switch (node.GetTag()) {
+        case NBT_TAG::Byte:
+            return "(Byte/Bool)";
+        case NBT_TAG::Short:
+            return "(Short)";
+        case NBT_TAG::Int:
+            return "(Integer)";
+        case NBT_TAG::Long:
+            return "(Long)";
+        case NBT_TAG::Float:
+            return "(Float)";
+        case NBT_TAG::Double:
+            return "(Double)";
+        case NBT_TAG::String:
+            return "(String)";
+        default:
+            return "[Unable to print: compound or array type]";
         }
     }
 };
